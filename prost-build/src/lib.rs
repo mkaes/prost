@@ -140,15 +140,14 @@ use std::process::Command;
 
 use log::debug;
 use log::trace;
-
 use prost::Message;
-use prost_types::{FileDescriptorProto, FileDescriptorSet};
+pub use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
 pub use crate::ast::{Comments, Method, Service};
 use crate::code_generator::CodeGenerator;
-use crate::extern_paths::ExternPaths;
+pub use crate::extern_paths::ExternPaths;
 use crate::ident::to_snake;
-use crate::message_graph::MessageGraph;
+pub use crate::message_graph::MessageGraph;
 use crate::path::PathMap;
 
 mod ast;
@@ -203,6 +202,25 @@ pub trait ServiceGenerator {
     fn finalize_package(&mut self, _package: &str, _buf: &mut String) {}
 }
 
+/// A compiler plugin that can be used to generate something else than rust code.
+pub trait CompilerPlugin {
+    /// Function will be called for each proto file that is parsed
+    fn start_file(&self, proto: &Path);
+
+    /// A compiler plugin that is called with the output of a protoc run.
+    /// The plugin itself is reponsible to write the output.
+    fn generate(
+        &self,
+        config: &Config,
+        message_graph: &MessageGraph,
+        extern_paths: &ExternPaths,
+        file: FileDescriptorProto,
+    );
+
+    // Function will be called when a proto file is done
+    fn finalize_file(&self, proto: &Path);
+}
+
 /// The map collection type to output for Protobuf `map` fields.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,6 +259,7 @@ impl Default for BytesType {
 pub struct Config {
     file_descriptor_set_path: Option<PathBuf>,
     service_generator: Option<Box<dyn ServiceGenerator>>,
+    compiler_plugin: Option<Box<dyn CompilerPlugin>>,
     map_type: PathMap<MapType>,
     bytes_type: PathMap<BytesType>,
     type_attributes: PathMap<String>,
@@ -258,6 +277,7 @@ pub struct Config {
     skip_debug: PathMap<()>,
     skip_protoc_run: bool,
     include_file: Option<PathBuf>,
+    unknown_fields_messages: Vec<String>,
     prost_path: Option<String>,
     fmt: bool,
 }
@@ -587,6 +607,12 @@ impl Config {
         self
     }
 
+    /// Configures the code generator to use the provided compiler plugin.
+    pub fn compiler_plugin(&mut self, compiler_plugin: Box<dyn CompilerPlugin>) -> &mut Self {
+        self.compiler_plugin = Some(compiler_plugin);
+        self
+    }
+
     /// Configures the code generator to not use the `prost_types` crate for Protobuf well-known
     /// types, and instead generate Protobuf well-known types from their `.proto` definitions.
     pub fn compile_well_known_types(&mut self) -> &mut Self {
@@ -850,6 +876,16 @@ impl Config {
         self
     }
 
+    pub fn unknown_fields_message<S>(&mut self, message: S) -> &mut Self
+    where
+        S: Into<String>,
+        S: AsRef<str>,
+    {
+        self.unknown_fields_messages
+            .push(message.as_ref().to_owned());
+        self
+    }
+
     /// Add an argument to the `protoc` protobuf compilation invocation.
     ///
     /// # Example `build.rs`
@@ -967,37 +1003,38 @@ impl Config {
             .collect::<HashMap<Module, String>>();
 
         let modules = self.generate(requests)?;
-        for (module, content) in &modules {
-            let file_name = file_names
-                .get(module)
-                .expect("every module should have a filename");
-            let output_path = target.join(file_name);
+        if let None = self.compiler_plugin {
+            for (module, content) in &modules {
+                let file_name = file_names
+                    .get(module)
+                    .expect("every module should have a filename");
+                let output_path = target.join(file_name);
 
-            let previous_content = fs::read(&output_path);
+                let previous_content = fs::read(&output_path);
 
-            if previous_content
-                .map(|previous_content| previous_content == content.as_bytes())
-                .unwrap_or(false)
-            {
-                trace!("unchanged: {:?}", file_name);
-            } else {
-                trace!("writing: {:?}", file_name);
-                fs::write(output_path, content)?;
+                if previous_content
+                    .map(|previous_content| previous_content == content.as_bytes())
+                    .unwrap_or(false)
+                {
+                    trace!("unchanged: {:?}", file_name);
+                } else {
+                    trace!("writing: {:?}", file_name);
+                    fs::write(output_path, content)?;
+                }
+            }
+
+            if let Some(ref include_file) = self.include_file {
+                trace!("Writing include file: {:?}", target.join(include_file));
+                let mut file = fs::File::create(target.join(include_file))?;
+                self.write_includes(
+                    modules.keys().collect(),
+                    &mut file,
+                    0,
+                    if target_is_env { None } else { Some(&target) },
+                )?;
+                file.flush()?;
             }
         }
-
-        if let Some(ref include_file) = self.include_file {
-            trace!("Writing include file: {:?}", target.join(include_file));
-            let mut file = fs::File::create(target.join(include_file))?;
-            self.write_includes(
-                modules.keys().collect(),
-                &mut file,
-                0,
-                if target_is_env { None } else { Some(&target) },
-            )?;
-            file.flush()?;
-        }
-
         Ok(())
     }
 
@@ -1075,28 +1112,27 @@ impl Config {
             for arg in &self.protoc_args {
                 cmd.arg(arg);
             }
-
+            let path = file_descriptor_set_path.as_path();
             for proto in protos {
                 cmd.arg(proto.as_ref());
-            }
 
-            debug!("Running: {:?}", cmd);
+                debug!("Running: {:?}", cmd);
 
-            let output = cmd.output().map_err(|error| {
-                Error::new(
-                    error.kind(),
-                    format!("failed to invoke protoc (hint: https://docs.rs/prost-build/#sourcing-protoc): (path: {:?}): {}", &protoc, error),
-                )
-            })?;
+                let output = cmd.output().map_err(|error| {
+                    Error::new(
+                        error.kind(),
+                        format!("failed to invoke protoc (hint: https://docs.rs/prost-build/#sourcing-protoc): (path: {:?}): {}", &protoc, error),
+                    )
+                })?;
 
-            if !output.status.success() {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    format!("protoc failed: {}", String::from_utf8_lossy(&output.stderr)),
-                ));
+                if !output.status.success() {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("protoc failed: {}", String::from_utf8_lossy(&output.stderr)),
+                    ));
+                }
             }
         }
-
         let buf = fs::read(&file_descriptor_set_path).map_err(|e| {
             Error::new(
                 e.kind(),
@@ -1203,13 +1239,22 @@ impl Config {
             if !request_fd.service.is_empty() {
                 packages.insert(request_module.clone(), request_fd.package().to_string());
             }
-            let buf = modules
+
+            let mut buf = modules
                 .entry(request_module.clone())
                 .or_insert_with(String::new);
-            CodeGenerator::generate(self, &message_graph, &extern_paths, request_fd, buf);
-            if buf.is_empty() {
-                // Did not generate any code, remove from list to avoid inclusion in include file or output file list
-                modules.remove(&request_module);
+            if let Some(ref compiler_plugin) = self.compiler_plugin {
+                let fs_name: String = request_fd.name().to_string();
+                let file_name = Path::new(&fs_name);
+                compiler_plugin.start_file(&file_name);
+                compiler_plugin.generate(self, &message_graph, &extern_paths, request_fd);
+                compiler_plugin.finalize_file(&file_name);
+            } else {
+                CodeGenerator::generate(self, &message_graph, &extern_paths, request_fd, &mut buf);
+                if buf.is_empty() {
+                    // Did not generate any code, remove from list to avoid inclusion in include file or output file list
+                    modules.remove(&request_module);
+                }
             }
         }
 
@@ -1245,6 +1290,7 @@ impl default::Default for Config {
         Config {
             file_descriptor_set_path: None,
             service_generator: None,
+            compiler_plugin: None,
             map_type: PathMap::default(),
             bytes_type: PathMap::default(),
             type_attributes: PathMap::default(),
@@ -1262,6 +1308,7 @@ impl default::Default for Config {
             skip_debug: PathMap::default(),
             skip_protoc_run: false,
             include_file: None,
+            unknown_fields_messages: Vec::new(),
             prost_path: None,
             fmt: true,
         }
@@ -1603,6 +1650,88 @@ mod tests {
         assert_eq!(&state.service_names, &["Greeting", "Farewell"]);
         assert_eq!(&state.package_names, &["helloworld"]);
         assert_eq!(state.finalized, 3);
+    }
+
+    #[derive(Default)]
+    struct TestCompilerState {
+        file_names: Vec<String>,
+        hello_world_dependencies: Vec<String>,
+        hello_world_messages: Vec<String>,
+        types_dependencies: Vec<String>,
+        types_messages: Vec<String>,
+    }
+    struct TestCompilerplugin {
+        state: Rc<RefCell<TestCompilerState>>,
+    }
+
+    impl TestCompilerplugin {
+        fn new(state: Rc<RefCell<TestCompilerState>>) -> Self {
+            Self { state }
+        }
+    }
+
+    impl CompilerPlugin for TestCompilerplugin {
+        fn start_file(&self, proto: &Path) {
+            let mut state = self.state.borrow_mut();
+            state.file_names.push(proto.to_str().unwrap().to_string());
+        }
+
+        fn generate(
+            &self,
+            _config: &Config,
+            _message_graph: &MessageGraph,
+            _extern_paths: &ExternPaths,
+            file: FileDescriptorProto,
+        ) {
+            let mut state = self.state.borrow_mut();
+            let file_name = file.name.unwrap();
+            let proto_name = state.file_names.last().unwrap();
+
+            if !proto_name.ends_with(&file_name) {
+                // those are includes
+            } else {
+                if proto_name == "src/fixtures/helloworld/hello.proto" {
+                    for dep in file.dependency {
+                        state.hello_world_dependencies.push(dep);
+                    }
+                    for m in file.message_type {
+                        state.hello_world_messages.push(m.name.unwrap());
+                    }
+                } else if proto_name == "src/types.proto" {
+                    for dep in file.dependency {
+                        state.types_dependencies.push(dep);
+                    }
+
+                    for m in file.message_type {
+                        state.types_messages.push(m.name.unwrap());
+                    }
+                }
+            }
+        }
+
+        fn finalize_file(&self, _proto: &Path) {}
+    }
+
+    #[test]
+    fn custom_compiler() {
+        let _ = env_logger::try_init();
+
+        let state = Rc::new(RefCell::new(TestCompilerState::default()));
+        let gen = TestCompilerplugin::new(Rc::clone(&state));
+
+        Config::new()
+            .compiler_plugin(Box::new(gen))
+            .compile_protos(&["src/hello.proto", "src/types.proto"], &["src"])
+            .unwrap();
+
+        let state = state.borrow();
+        assert_eq!(state.file_names.len(), 2);
+        assert_eq!(state.types_dependencies.len(), 0);
+        assert_eq!(state.hello_world_messages.len(), 0);
+        assert_eq!(state.types_messages.len(), 2);
+        assert_eq!(state.types_messages[0], "Message");
+        assert_eq!(state.types_messages[1], "Response");
+        assert_eq!(state.hello_world_dependencies.len(), 1);
     }
 
     #[test]

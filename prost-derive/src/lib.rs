@@ -81,6 +81,10 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let has_unknown_fields_accessor = fields.iter().any(|(_, f)| match f {
+        Field::UnknownFields(_) => true,
+        _ => false,
+    });
     // We want Debug to be in declaration order
     let unsorted_fields = fields.clone();
 
@@ -88,7 +92,7 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
     // TODO: This encodes oneof fields in the position of their lowest tag,
     // regardless of the currently occupied variant, is that consequential?
     // See: https://developers.google.com/protocol-buffers/docs/encoding#order
-    fields.sort_by_key(|&(_, ref field)| field.tags().into_iter().min().unwrap());
+    fields.sort_by_key(|&(_, ref field)| field.tags().into_iter().min().unwrap_or(std::u32::MAX));
     let fields = fields;
 
     let mut tags = fields
@@ -111,18 +115,21 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
         .map(|&(ref field_ident, ref field)| field.encode(quote!(self.#field_ident)));
 
     let merge = fields.iter().map(|&(ref field_ident, ref field)| {
-        let merge = field.merge(quote!(value));
-        let tags = field.tags().into_iter().map(|tag| quote!(#tag));
-        let tags = Itertools::intersperse(tags, quote!(|));
-
-        quote! {
-            #(#tags)* => {
-                let mut value = &mut self.#field_ident;
-                #merge.map_err(|mut error| {
-                    error.push(STRUCT_NAME, stringify!(#field_ident));
-                    error
-                })
-            },
+        if let Field::UnknownFields(_) = field {
+            quote! {}
+        } else {
+            let merge = field.merge(quote!(value));
+            let tags = field.tags().into_iter().map(|tag| quote!(#tag));
+            let tags = Itertools::intersperse(tags, quote!(|));
+            quote! {
+                #(#tags)* => {
+                    let mut value = &mut self.#field_ident;
+                    #merge.map_err(|mut error| {
+                        error.push(STRUCT_NAME, stringify!(#field_ident));
+                        error
+                    })
+                },
+            }
         }
     });
 
@@ -171,6 +178,15 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
         }
     };
 
+    let unknown_field_handler = if has_unknown_fields_accessor {
+        quote! {
+            ::prost::encoding::unknown_field(wire_type, tag, buf, &mut self.protobuf_unknown_fields, ctx)
+        }
+    } else {
+        quote! {
+            ::prost::encoding::skip_field(wire_type, tag, buf, ctx)
+        }
+    };
     let expanded = quote! {
         impl #impl_generics ::prost::Message for #ident #ty_generics #where_clause {
             #[allow(unused_variables)]
@@ -190,7 +206,7 @@ fn try_message(input: TokenStream) -> Result<TokenStream, Error> {
                 #struct_name
                 match tag {
                     #(#merge)*
-                    _ => ::prost::encoding::skip_field(wire_type, tag, buf, ctx),
+                    _ => #unknown_field_handler,
                 }
             }
 

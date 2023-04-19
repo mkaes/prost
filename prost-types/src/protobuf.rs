@@ -665,6 +665,9 @@ pub struct MessageOptions {
     /// The parser stores options it doesn't recognize here. See above.
     #[prost(message, repeated, tag = "999")]
     pub uninterpreted_option: ::prost::alloc::vec::Vec<UninterpretedOption>,
+
+    #[prost(unknown_fields)]
+    pub protobuf_unknown_fields: ::prost::alloc::vec::Vec<::prost::UnknownField>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -746,6 +749,9 @@ pub struct FieldOptions {
     /// The parser stores options it doesn't recognize here. See above.
     #[prost(message, repeated, tag = "999")]
     pub uninterpreted_option: ::prost::alloc::vec::Vec<UninterpretedOption>,
+
+    #[prost(unknown_fields)]
+    pub protobuf_unknown_fields: ::prost::alloc::vec::Vec<::prost::UnknownField>,
 }
 /// Nested message and enum types in `FieldOptions`.
 pub mod field_options {
@@ -881,6 +887,9 @@ pub struct ServiceOptions {
     /// The parser stores options it doesn't recognize here. See above.
     #[prost(message, repeated, tag = "999")]
     pub uninterpreted_option: ::prost::alloc::vec::Vec<UninterpretedOption>,
+
+    #[prost(unknown_fields)]
+    pub protobuf_unknown_fields: ::prost::alloc::vec::Vec<::prost::UnknownField>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -901,6 +910,9 @@ pub struct MethodOptions {
     /// The parser stores options it doesn't recognize here. See above.
     #[prost(message, repeated, tag = "999")]
     pub uninterpreted_option: ::prost::alloc::vec::Vec<UninterpretedOption>,
+
+    #[prost(unknown_fields)]
+    pub protobuf_unknown_fields: ::prost::alloc::vec::Vec<::prost::UnknownField>,
 }
 /// Nested message and enum types in `MethodOptions`.
 pub mod method_options {
